@@ -1,0 +1,12 @@
+# Use Node 20 (LTS) or 22 instead of 18
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install serve globally for serving the built app
+RUN npm install -g serve
+
+EXPOSE 3000
+
+# The project files will be bind-mounted at runtime
+CMD ["sh", "-c", "npm install && npm run build && serve -s dist -l 3000"]
