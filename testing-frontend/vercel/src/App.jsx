@@ -1,35 +1,34 @@
-// App.js
-// import { useState } from "react";
-// import axios from "axios";
-import DeployPanel from "./Display";
+import { useEffect, useState } from "react";
+import Landing from "./pages/Landing";
+import Login from "./pages/Login";
+import Dashboard from "./pages/Dashboard";
+import Deploy from "./pages/Deploy";
 
-function App() {
-  // const [repo, setRepo] = useState("");
-  // const [projectName, setProjectName] = useState("");
-
-  // const deploy = async () => {
-  //   const res = await axios.post("http://localhost:5000/api/projects/create", {
-  //     name: projectName,
-  //     githubUrl: repo,
-  //   });
-
-  //   alert(res.data.url);
-  // };
-
-  return (
-    // <div>
-    //   <h1>Mini Vercel</h1>
-    //   <input
-    //     placeholder="project name"
-    //     onChange={(e) => {
-    //       setProjectName(e.target.value);
-    //     }}
-    //   />
-    //   <input onChange={(e) => setRepo(e.target.value)} />
-    //   <button onClick={deploy}>Deploy</button>
-    // </div>
-    <DeployPanel />
-  );
+function normalizePath(path) {
+  if (!path) return "/";
+  if (!path.startsWith("/")) return `/${path}`;
+  return path;
 }
 
-export default App;
+export default function App() {
+  const [path, setPath] = useState(() => normalizePath(window.location.pathname));
+
+  useEffect(() => {
+    const onPop = () => setPath(normalizePath(window.location.pathname));
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  function navigate(to) {
+    const next = normalizePath(to);
+    if (next === path) return;
+    window.history.pushState({}, "", next);
+    setPath(next);
+  }
+
+  if (path === "/login") return <Login navigate={navigate} />;
+  if (path === "/dashboard") return <Dashboard navigate={navigate} />;
+  if (path === "/deploy") return <Deploy navigate={navigate} />;
+  return <Landing navigate={navigate} />;
+}
+

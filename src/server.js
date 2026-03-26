@@ -1,11 +1,13 @@
 import express from "express";
 import mongoose from "mongoose";
 import router from "./routes/project.routes.js";
+import authRouter from "./routes/auth.routes.js";
 import cors from "cors";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use("/api/auth", authRouter);
 app.use("/api/projects", router);
 
 const PORT = process.env.PORT || 5000;
