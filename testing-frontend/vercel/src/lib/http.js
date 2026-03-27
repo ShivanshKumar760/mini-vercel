@@ -1,6 +1,9 @@
 import { getAuthHeaders } from "./auth";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
+// const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
+const API_BASE =
+  import.meta.env.VITE_API_BASE ||
+  "https://treasa-crewneck-dona.ngrok-free.dev";
 
 export { API_BASE };
 
@@ -31,4 +34,3 @@ export async function apiJson(path, options = {}) {
   if (!isJson) return null;
   return res.json();
 }
-
