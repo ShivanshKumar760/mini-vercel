@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { getToken } from "../lib/auth";
 import DeployAnimation from "./DeployAnimation";
+import DeployPipeline from "./DeployPipeline";
 
 export default function Landing({ navigate }) {
   useEffect(() => {
@@ -189,6 +190,14 @@ export default function Landing({ navigate }) {
             — clone, Docker build, npm install, serve.
           </p>
           <DeployAnimation />
+        </section>
+
+        <section
+          style={{
+            marginTop: "20px",
+          }}
+        >
+          <DeployPipeline />
         </section>
       </main>
     </div>

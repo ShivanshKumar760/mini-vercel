@@ -406,7 +406,15 @@ function UploadDeploy({ navigate }) {
     if (file) {
       form.append("build", file);
     } else {
-      for (const f of files) form.append("files", f);
+      const relativePaths = [];
+      for (const f of files) {
+        form.append("files", f);
+        // webkitRelativePath is "dist/assets/main.js" for folder uploads
+        // falls back to plain filename for drag-and-drop individual files
+        relativePaths.push(f.webkitRelativePath || f.name);
+      }
+      // Send paths as one JSON field so the backend can reconstruct folders
+      form.append("relativePaths", JSON.stringify(relativePaths));
     }
 
     try {
@@ -643,9 +651,14 @@ function UploadDeploy({ navigate }) {
 export default function Deploy({ navigate }) {
   const [tab, setTab] = useState("github"); // "github" | "upload"
 
-  // useEffect(() => {
-  //   if (!getAuthHeaders().Authorization) navigate("/login");
-  // }, []);
+  useEffect(() => {
+    if (!getAuthHeaders().Authorization) navigate("/login");
+  }, []);
+
+  // Full-screen takeover for the code tab — render before the normal shell
+  if (tab === "code") {
+    return <CodeDeploy navigate={navigate} onBack={() => setTab("github")} />;
+  }
 
   return (
     <div style={s.page}>

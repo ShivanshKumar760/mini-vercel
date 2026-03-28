@@ -9,6 +9,7 @@
     "typescript": "^5.0.0"
   },
   "dependencies": {
+    "adm-zip": "^0.5.16",
     "axios": "^1.13.6",
     "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.3",
@@ -18,6 +19,8 @@
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.3.3",
-    "simple-git": "^3.33.0"
+    "multer": "^2.1.1",
+    "simple-git": "^3.33.0",
+    "uuid": "^13.0.0"
   }
 }
