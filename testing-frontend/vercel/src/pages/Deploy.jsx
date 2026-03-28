@@ -1,11 +1,12 @@
-/* eslint-disable*/
+// ─── Deploy.jsx ───────────────────────────────────────────────────────────────
+/* eslint-disable */
 import { useEffect, useRef, useState } from "react";
 import { getAuthHeaders, clearToken } from "../lib/auth";
 import { API_BASE } from "../lib/http";
 import CodeDeploy from "./Codedeploy";
+import DeployPipeline, { sseMessageToNodeId } from "./DeployPipelineRealTime";
 
-// ─── Step config ─────────────────────────────────────────────────────────────
-
+// ─── Step labels ──────────────────────────────────────────────────────────────
 const STEP_LABELS = [
   { key: "clone", emoji: "📥", label: "Cloning repository" },
   { key: "install", emoji: "📦", label: "Installing dependencies" },
@@ -33,10 +34,21 @@ function matchStep(msg) {
   return null;
 }
 
-// ─── Shared sub-components ───────────────────────────────────────────────────
+// Which connector idx fires when a node is activated
+const CONN_FOR = {
+  github: null,
+  express: 0,
+  nodejs: 1,
+  docker: 2,
+  npm: 3,
+  react: 4,
+  mongo: 5,
+};
+
+// ─── Shared components ────────────────────────────────────────────────────────
 
 function StepRow({ emoji, label, state }) {
-  const stateStyles = {
+  const st = {
     idle: { dot: "rgba(0,0,0,0.15)", text: "rgba(11,11,15,0.4)", badge: null },
     running: {
       dot: "#f97316",
@@ -53,8 +65,11 @@ function StepRow({ emoji, label, state }) {
       text: "#dc2626",
       badge: { color: "#ef4444", label: "✗ failed" },
     },
+  }[state] || {
+    dot: "rgba(0,0,0,0.15)",
+    text: "rgba(11,11,15,0.4)",
+    badge: null,
   };
-  const st = stateStyles[state] || stateStyles.idle;
 
   return (
     <div
@@ -98,20 +113,17 @@ function StepRow({ emoji, label, state }) {
 }
 
 function TerminalPanel({ logs }) {
-  const logsEndRef = useRef(null);
+  const endRef = useRef(null);
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
-
-  const logColor = {
+  const C = {
     stdout: "#16a34a",
     stderr: "#ea580c",
     system: "#2563eb",
     error: "#dc2626",
   };
-
   if (!logs.length) return null;
-
   return (
     <div style={s.termCol}>
       <div style={s.termBar}>
@@ -134,13 +146,13 @@ function TerminalPanel({ logs }) {
         {logs.map((log) => (
           <div
             key={log.id}
-            style={{ ...s.logLine, color: logColor[log.type] || "#555" }}
+            style={{ ...s.logLine, color: C[log.type] || "#555" }}
           >
             <span style={s.logBadge}>{log.type}</span>
             {log.message}
           </div>
         ))}
-        <div ref={logsEndRef} />
+        <div ref={endRef} />
       </div>
     </div>
   );
@@ -155,91 +167,197 @@ function GitHubDeploy({ navigate }) {
   const [steps, setSteps] = useState(
     Object.fromEntries(STEP_LABELS.map((s) => [s.key, "idle"]))
   );
-  const [activeStep, setActiveStep] = useState(null);
   const [deployedUrl, setDeployedUrl] = useState(null);
   const [error, setError] = useState(null);
   const [deploying, setDeploying] = useState(false);
   const activeStepRef = useRef(null);
 
+  // ── Pipeline state ─────────────────────────────────────────────────────────
+  // These drive DeployPipeline in "controlled" mode — every SSE event updates them
+  const [pNodes, setPNodes] = useState({});
+  const [pConns, setPConns] = useState({});
+  const [pLogs, setPLogs] = useState([]);
+  const [pDone, setPDone] = useState(false);
+
   function resetState() {
     setLogs([]);
     setSteps(Object.fromEntries(STEP_LABELS.map((s) => [s.key, "idle"])));
-    setActiveStep(null);
     setDeployedUrl(null);
     setError(null);
+    activeStepRef.current = null;
+    // Reset pipeline
+    setPNodes({});
+    setPConns({});
+    setPLogs([]);
+    setPDone(false);
   }
 
   function markStep(key, state) {
-    setSteps((prev) => ({ ...prev, [key]: state }));
-    if (state === "running") {
-      setActiveStep(key);
-      activeStepRef.current = key;
-    }
-    if (state === "done" || state === "error") {
-      setActiveStep(null);
-      activeStepRef.current = null;
-    }
+    setSteps((p) => ({ ...p, [key]: state }));
+    if (state === "running") activeStepRef.current = key;
+    if (state === "done" || state === "error") activeStepRef.current = null;
   }
 
   function pushLog(type, message) {
-    setLogs((prev) => [
-      ...prev,
-      { type, message, id: Date.now() + Math.random() },
-    ]);
+    setLogs((p) => [...p, { type, message, id: Date.now() + Math.random() }]);
   }
 
-  function handleSSEEvent(event, data) {
-    if (event === "log") {
-      pushLog(data.type, data.message);
-      const m = matchStep(data.message);
+  // ── Core: drive pipeline from an SSE event ─────────────────────────────────
+  // This is the only place that touches pNodes/pConns — keeps it centralized.
+  function advancePipeline(eventType, data, nodeId) {
+    if (!nodeId) return;
+
+    const isDoneEvent = eventType === "step_done" || eventType === "done";
+    const newState = isDoneEvent ? "done" : "running";
+
+    setPNodes((prev) => {
+      // Don't downgrade a done node back to running
+      if (prev[nodeId] === "done" && newState === "running") return prev;
+      return { ...prev, [nodeId]: newState };
+    });
+
+    const ci = CONN_FOR[nodeId];
+    if (ci != null) {
+      setPConns((prev) => ({
+        ...prev,
+        [ci]: newState === "done" ? "done" : "active",
+      }));
+    }
+  }
+
+  function addPLog(t, m) {
+    setPLogs((prev) => [...prev, { t, m, id: Date.now() + Math.random() }]);
+  }
+
+  // ── SSE event handler ──────────────────────────────────────────────────────
+  function handleSSEEvent(eventType, data) {
+    const msg = data?.message || "";
+
+    // 1. Map this event to a pipeline node
+    const nodeId = sseMessageToNodeId(eventType, data);
+
+    // 2. Drive the pipeline
+    advancePipeline(eventType, data, nodeId);
+
+    // 3. Mirror to the pipeline's own log panel
+    if (eventType === "log") {
+      if (data.type === "stdout") addPLog("sys", msg);
+      if (data.type === "stderr") addPLog("err", msg);
+    }
+    if (eventType === "step_start") addPLog("sys", `▶ ${msg}`);
+    if (eventType === "step_done") addPLog("ok", `✓ ${msg}`);
+    if (eventType === "status") addPLog("sys", msg);
+    if (eventType === "system") addPLog("sys", msg);
+
+    // 4. Drive the step tracker (existing UI below the form)
+    if (eventType === "log") {
+      pushLog(data.type, msg);
+      const m = matchStep(msg);
       if (m && data.type === "stdout")
-        setSteps((prev) => {
-          if (prev[m] === "idle") markStep(m, "running");
-          return prev;
+        setSteps((p) => {
+          if (p[m] === "idle") markStep(m, "running");
+          return p;
         });
     }
-    if (event === "status") {
-      if (data.message.toLowerCase().includes("cloning"))
-        markStep("clone", "running");
-      if (data.message.toLowerCase().includes("cloned"))
-        markStep("clone", "done");
-      const m = matchStep(data.message);
+    if (eventType === "status") {
+      if (msg.toLowerCase().includes("cloning")) markStep("clone", "running");
+      if (msg.toLowerCase().includes("cloned")) markStep("clone", "done");
+      const m = matchStep(msg);
       if (m) markStep(m, "running");
     }
-    if (event === "step_start") {
-      const m = matchStep(data.message);
+    if (eventType === "step_start") {
+      const m = matchStep(msg);
       if (m) markStep(m, "running");
-      pushLog("system", data.message);
+      pushLog("system", msg);
     }
-    if (event === "step_done") {
-      const m = matchStep(data.message);
+    if (eventType === "step_done") {
+      const m = matchStep(msg);
       if (m) markStep(m, "done");
-      pushLog("system", data.message);
+      pushLog("system", msg);
     }
-    if (event === "done") {
+
+    // 5. Final done / error
+    if (eventType === "done") {
       setSteps(Object.fromEntries(STEP_LABELS.map((s) => [s.key, "done"])));
       setDeployedUrl(data.url);
       setDeploying(false);
-      setTimeout(() => navigate("/dashboard"), 1200);
+
+      // Mark all pipeline nodes done
+      const allDone = Object.fromEntries(
+        ["github", "express", "nodejs", "docker", "npm", "react", "mongo"].map(
+          (id) => [id, "done"]
+        )
+      );
+      setPNodes(allDone);
+      setPConns({
+        0: "done",
+        1: "done",
+        2: "done",
+        3: "done",
+        4: "done",
+        5: "done",
+      });
+      setPDone(true);
+      addPLog("ok", `🚀 Live → ${data.url}`);
+
+      setTimeout(() => navigate("/dashboard"), 2000);
     }
-    if (event === "error") {
+
+    if (eventType === "error") {
       if (activeStepRef.current) markStep(activeStepRef.current, "error");
-      setError(data.message);
+      // Mark currently running pipeline node as error
+      setPNodes((prev) => {
+        const runningId = Object.entries(prev).find(
+          ([, v]) => v === "running"
+        )?.[0];
+        return runningId ? { ...prev, [runningId]: "error" } : prev;
+      });
+      setError(msg);
       setDeploying(false);
+      addPLog("err", msg);
     }
   }
 
+  // ── Deploy ─────────────────────────────────────────────────────────────────
   async function deploy() {
     if (!name.trim() || !githubUrl.trim() || deploying) return;
     resetState();
     setDeploying(true);
     markStep("clone", "running");
+
+    // Bootstrap: github → express fire immediately on click (before SSE starts)
+    setPNodes({ github: "running" });
+    addPLog("sys", `POST /api/projects/create`);
+
+    // github done + express running after a short delay
+    setTimeout(() => {
+      setPNodes((p) => ({ ...p, github: "done", express: "running" }));
+      setPConns((p) => ({ ...p, 0: "done" }));
+      addPLog("ok", "Request received");
+    }, 300);
+
+    // express done + mongo running (mongo fires from express, parallel to nodejs)
+    setTimeout(() => {
+      setPNodes((p) => ({ ...p, express: "done", mongo: "running" }));
+      setPConns((p) => ({ ...p, 1: "active", 5: "active" }));
+      addPLog("ok", "JWT verified — auth OK");
+      addPLog("sys", "Saving project to MongoDB…");
+    }, 700);
+
+    // mongo done
+    setTimeout(() => {
+      setPNodes((p) => ({ ...p, mongo: "done" }));
+      setPConns((p) => ({ ...p, 5: "done" }));
+      addPLog("ok", "Project document created");
+    }, 1100);
+
     try {
       const response = await fetch(`${API_BASE}/api/projects/create`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeaders() },
         body: JSON.stringify({ name, githubUrl }),
       });
+
       if (!response.ok) {
         if (response.status === 401) {
           clearToken();
@@ -250,9 +368,12 @@ function GitHubDeploy({ navigate }) {
           (await response.text().catch(() => "")) || `Error ${response.status}`
         );
       }
+
+      // Read SSE stream
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -278,95 +399,106 @@ function GitHubDeploy({ navigate }) {
     } catch (err) {
       setError(err?.message || "Connection error");
       setDeploying(false);
+      addPLog("err", err?.message || "Connection error");
     }
   }
 
   const showPanel = deploying || deployedUrl || error || logs.length > 0;
 
   return (
-    <div style={s.twoCol}>
-      {/* Form column */}
-      <div style={s.formCol}>
-        <div style={s.fieldGroup}>
-          <div style={s.field}>
-            <label style={s.label}>Project name</label>
-            <input
-              style={s.input}
-              placeholder="my-app"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {/* Pipeline — full width, synced to real SSE events */}
+      <DeployPipeline
+        externalNodeStates={pNodes}
+        externalConnStates={pConns}
+        externalLogs={pLogs}
+        externalDone={pDone}
+        externalRunning={deploying}
+      />
+
+      {/* Form + terminal */}
+      <div style={s.twoCol}>
+        <div style={s.formCol}>
+          <div style={s.fieldGroup}>
+            <div style={s.field}>
+              <label style={s.label}>Project name</label>
+              <input
+                style={s.input}
+                placeholder="my-app"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={deploying}
+              />
+            </div>
+            <div style={s.field}>
+              <label style={s.label}>GitHub URL</label>
+              <input
+                style={s.input}
+                placeholder="https://github.com/user/repo"
+                value={githubUrl}
+                onChange={(e) => setGithubUrl(e.target.value)}
+                disabled={deploying}
+              />
+            </div>
+            <button
+              style={deploying ? s.deployBtnBusy : s.deployBtn}
+              onClick={deploy}
               disabled={deploying}
-            />
+            >
+              {deploying ? "Deploying…" : "Deploy →"}
+            </button>
           </div>
-          <div style={s.field}>
-            <label style={s.label}>GitHub URL</label>
-            <input
-              style={s.input}
-              placeholder="https://github.com/user/repo"
-              value={githubUrl}
-              onChange={(e) => setGithubUrl(e.target.value)}
-              disabled={deploying}
-            />
-          </div>
-          <button
-            style={deploying ? s.deployBtnBusy : s.deployBtn}
-            onClick={deploy}
-            disabled={deploying}
-          >
-            {deploying ? "Deploying…" : "Deploy →"}
-          </button>
+
+          {showPanel && (
+            <div style={s.stepsCard}>
+              {STEP_LABELS.map((step) => (
+                <StepRow
+                  key={step.key}
+                  emoji={step.emoji}
+                  label={step.label}
+                  state={steps[step.key]}
+                />
+              ))}
+            </div>
+          )}
+
+          {deployedUrl && (
+            <div style={s.successCard}>
+              <div style={s.successTitle}>🚀 Deployed!</div>
+              <a
+                href={deployedUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={s.successLink}
+              >
+                {deployedUrl}
+              </a>
+              <div style={s.successHint}>Redirecting to dashboard…</div>
+            </div>
+          )}
+          {error && <div style={s.errorCard}>⚠ {error}</div>}
         </div>
 
-        {showPanel && (
-          <div style={s.stepsCard}>
-            {STEP_LABELS.map((step) => (
-              <StepRow
-                key={step.key}
-                emoji={step.emoji}
-                label={step.label}
-                state={steps[step.key]}
-              />
-            ))}
-          </div>
-        )}
-
-        {deployedUrl && (
-          <div style={s.successCard}>
-            <div style={s.successTitle}>🚀 Deployed!</div>
-            <a
-              href={deployedUrl}
-              target="_blank"
-              rel="noreferrer"
-              style={s.successLink}
-            >
-              {deployedUrl}
-            </a>
-            <div style={s.successHint}>Redirecting to dashboard…</div>
-          </div>
-        )}
-        {error && <div style={s.errorCard}>⚠ {error}</div>}
+        <TerminalPanel logs={logs} />
       </div>
-
-      {/* Terminal column */}
-      <TerminalPanel logs={logs} />
     </div>
   );
 }
 
-// ─── Tab 2: Drag & Drop Upload ────────────────────────────────────────────────
+// ─── Tab 2: Upload Deploy ─────────────────────────────────────────────────────
 
 function UploadDeploy({ navigate }) {
   const [name, setName] = useState("");
   const [dragging, setDragging] = useState(false);
-  const [status, setStatus] = useState("idle"); // idle | uploading | done | error
+  const [status, setStatus] = useState("idle");
   const [logs, setLogs] = useState([]);
   const [steps, setSteps] = useState(
     Object.fromEntries(UPLOAD_STEP_LABELS.map((s) => [s.key, "idle"]))
   );
   const [deployedUrl, setDeployedUrl] = useState(null);
   const [error, setError] = useState(null);
-  const [selectedFile, setSelectedFile] = useState(null); // for zip
-  const [selectedFiles, setSelectedFiles] = useState([]); // for folder/multi
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [selectedFiles, setSelectedFiles] = useState([]);
   const inputZipRef = useRef();
   const inputFolderRef = useRef();
 
@@ -379,16 +511,11 @@ function UploadDeploy({ navigate }) {
       Object.fromEntries(UPLOAD_STEP_LABELS.map((s) => [s.key, "idle"]))
     );
   }
-
   function markStep(key, state) {
-    setSteps((prev) => ({ ...prev, [key]: state }));
+    setSteps((p) => ({ ...p, [key]: state }));
   }
-
   function pushLog(type, message) {
-    setLogs((prev) => [
-      ...prev,
-      { type, message, id: Date.now() + Math.random() },
-    ]);
+    setLogs((p) => [...p, { type, message, id: Date.now() + Math.random() }]);
   }
 
   async function deployFiles(file, files) {
@@ -396,27 +523,21 @@ function UploadDeploy({ navigate }) {
     setStatus("uploading");
     markStep("extract", "running");
     pushLog("system", "📤 Uploading build files…");
-
     const form = new FormData();
     form.append(
       "name",
       name || (file ? file.name.replace(".zip", "") : "upload")
     );
-
     if (file) {
       form.append("build", file);
     } else {
       const relativePaths = [];
       for (const f of files) {
         form.append("files", f);
-        // webkitRelativePath is "dist/assets/main.js" for folder uploads
-        // falls back to plain filename for drag-and-drop individual files
         relativePaths.push(f.webkitRelativePath || f.name);
       }
-      // Send paths as one JSON field so the backend can reconstruct folders
       form.append("relativePaths", JSON.stringify(relativePaths));
     }
-
     try {
       const res = await fetch(`${API_BASE}/api/upload`, {
         method: "POST",
@@ -433,15 +554,9 @@ function UploadDeploy({ navigate }) {
         throw new Error(err.error || err.message || `Error ${res.status}`);
       }
       const data = await res.json();
-
       markStep("extract", "done");
       markStep("serve", "done");
-
-      // Surface backend logs
-      if (data.logs?.length) {
-        for (const l of data.logs) pushLog(l.type, l.msg);
-      }
-
+      if (data.logs?.length) for (const l of data.logs) pushLog(l.type, l.msg);
       pushLog("system", `🚀 Live → ${data.url}`);
       setDeployedUrl(data.url);
       setStatus("done");
@@ -464,32 +579,23 @@ function UploadDeploy({ navigate }) {
     setSelectedFiles([]);
     deployFiles(file, null);
   }
-
   function handleFolderFiles(files) {
     if (!files?.length) return;
-    const arr = Array.from(files);
-    setSelectedFiles(arr);
+    setSelectedFiles(Array.from(files));
     setSelectedFile(null);
-    deployFiles(null, arr);
+    deployFiles(null, Array.from(files));
   }
-
   function onDrop(e) {
     e.preventDefault();
     setDragging(false);
-    const items = e.dataTransfer.items;
-
-    if (items) {
-      // Check if folder was dropped
-      const dtFiles = Array.from(e.dataTransfer.files);
-      if (dtFiles.length === 1 && dtFiles[0].name.endsWith(".zip")) {
-        handleZipFile(dtFiles[0]);
-        return;
-      }
-      // Multiple files (folder contents)
-      if (dtFiles.length > 1) {
-        handleFolderFiles(dtFiles);
-        return;
-      }
+    const dtFiles = Array.from(e.dataTransfer.files);
+    if (dtFiles.length === 1 && dtFiles[0].name.endsWith(".zip")) {
+      handleZipFile(dtFiles[0]);
+      return;
+    }
+    if (dtFiles.length > 1) {
+      handleFolderFiles(dtFiles);
+      return;
     }
     handleZipFile(e.dataTransfer.files?.[0]);
   }
@@ -498,12 +604,11 @@ function UploadDeploy({ navigate }) {
   const fileLabel = selectedFile
     ? `📦 ${selectedFile.name}`
     : selectedFiles.length
-    ? `📁 ${selectedFiles.length} files selected`
+    ? `📁 ${selectedFiles.length} files`
     : null;
 
   return (
     <div style={s.twoCol}>
-      {/* Upload column */}
       <div style={s.formCol}>
         <div style={s.fieldGroup}>
           <div style={s.field}>
@@ -516,8 +621,6 @@ function UploadDeploy({ navigate }) {
               disabled={uploading}
             />
           </div>
-
-          {/* Drop zone */}
           <div
             onDragOver={(e) => {
               e.preventDefault();
@@ -543,9 +646,7 @@ function UploadDeploy({ navigate }) {
               <>
                 <div style={s.dropIcon}>⏳</div>
                 <div style={s.dropTitle}>Deploying…</div>
-                <div style={s.dropSub}>
-                  Uploading and starting your container
-                </div>
+                <div style={s.dropSub}>Uploading and starting container</div>
               </>
             ) : status === "done" ? (
               <>
@@ -561,7 +662,7 @@ function UploadDeploy({ navigate }) {
                 <div style={s.dropSub}>
                   {fileLabel
                     ? "Drop again to replace"
-                    : "Accepts a .zip file or drag individual dist/ files"}
+                    : "Accepts a .zip or dist/ files"}
                 </div>
                 <div style={s.dropButtons}>
                   <button
@@ -581,8 +682,6 @@ function UploadDeploy({ navigate }) {
                 </div>
               </>
             )}
-
-            {/* Hidden inputs */}
             <input
               ref={inputZipRef}
               type="file"
@@ -600,16 +699,12 @@ function UploadDeploy({ navigate }) {
               onChange={(e) => handleFolderFiles(e.target.files)}
             />
           </div>
-
-          {/* Helper note */}
           <div style={s.uploadHint}>
             <span style={{ color: "#f97316", fontWeight: 700 }}>Tip:</span> Run{" "}
             <code style={s.code}>npm run build</code> locally, then zip your{" "}
-            <code style={s.code}>dist/</code> folder or drag the files directly.
+            <code style={s.code}>dist/</code> folder.
           </div>
         </div>
-
-        {/* Step tracker */}
         {(uploading || status === "done" || status === "error") && (
           <div style={s.stepsCard}>
             {UPLOAD_STEP_LABELS.map((step) => (
@@ -622,7 +717,6 @@ function UploadDeploy({ navigate }) {
             ))}
           </div>
         )}
-
         {deployedUrl && (
           <div style={s.successCard}>
             <div style={s.successTitle}>🚀 Deployed!</div>
@@ -634,45 +728,39 @@ function UploadDeploy({ navigate }) {
             >
               {deployedUrl}
             </a>
-            <div style={s.successHint}>Redirecting to dashboard…</div>
+            <div style={s.successHint}>Redirecting…</div>
           </div>
         )}
         {error && <div style={s.errorCard}>⚠ {error}</div>}
       </div>
-
-      {/* Terminal column */}
       <TerminalPanel logs={logs} />
     </div>
   );
 }
 
-// ─── Main Deploy Page ─────────────────────────────────────────────────────────
+// ─── Main Deploy page ─────────────────────────────────────────────────────────
 
 export default function Deploy({ navigate }) {
-  const [tab, setTab] = useState("github"); // "github" | "upload"
+  const [tab, setTab] = useState("github");
 
   useEffect(() => {
     if (!getAuthHeaders().Authorization) navigate("/login");
   }, []);
 
-  // Full-screen takeover for the code tab — render before the normal shell
-  if (tab === "code") {
+  if (tab === "code")
     return <CodeDeploy navigate={navigate} onBack={() => setTab("github")} />;
-  }
 
   return (
     <div style={s.page}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&display=swap');
         * { box-sizing: border-box; }
-        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
         input:focus { outline: none; border-color: #f97316 !important; }
         ::-webkit-scrollbar { width: 5px; }
         ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 4px; }
         .tab-btn:hover { background: rgba(249,115,22,0.06) !important; }
       `}</style>
 
-      {/* TOP BAR */}
       <header style={s.topBar}>
         <div style={s.brand}>
           <span style={s.brandMark}>▲</span>
@@ -684,69 +772,57 @@ export default function Deploy({ navigate }) {
       </header>
 
       <div style={s.wrap}>
-        {/* Page header */}
         <div style={s.pageHead}>
-          <div>
-            <h1 style={s.heading}>New deployment</h1>
-            <p style={s.sub}>
-              Deploy from GitHub or upload a pre-built project.
-            </p>
-          </div>
+          <h1 style={s.heading}>New deployment</h1>
+          <p style={s.sub}>Deploy from GitHub or upload a pre-built project.</p>
         </div>
 
-        {/* Tab switcher */}
         <div style={s.tabRow}>
-          <button
-            className="tab-btn"
-            style={tab === "github" ? s.tabActive : s.tab}
-            onClick={() => setTab("github")}
-          >
-            <span style={s.tabIcon}>🐙</span>
-            <div>
-              <div style={s.tabLabel}>GitHub</div>
-              <div style={s.tabDesc}>Clone & build from repo</div>
-            </div>
-            {tab === "github" && <div style={s.tabPill}>Selected</div>}
-          </button>
-
-          <button
-            className="tab-btn"
-            style={tab === "upload" ? s.tabActive : s.tab}
-            onClick={() => setTab("upload")}
-          >
-            <span style={s.tabIcon}>📦</span>
-            <div>
-              <div style={s.tabLabel}>Upload Build</div>
-              <div style={s.tabDesc}>Drop dist/ zip or files</div>
-            </div>
-            {tab === "upload" && <div style={s.tabPill}>Selected</div>}
-          </button>
-
-          <button
-            style={tab === "code" ? s.tabActive : s.tab}
-            onClick={() => setTab("code")}
-          >
-            <span style={s.tabIcon}>💻</span>
-            <div>
-              <div style={s.tabLabel}>Code & Deploy</div>
-              <div style={s.tabDesc}>Write React, deploy live</div>
-            </div>
-          </button>
+          {[
+            {
+              key: "github",
+              icon: "🐙",
+              label: "GitHub",
+              desc: "Clone & build from repo",
+            },
+            {
+              key: "upload",
+              icon: "📦",
+              label: "Upload Build",
+              desc: "Drop dist/ zip or files",
+            },
+            {
+              key: "code",
+              icon: "💻",
+              label: "Code & Deploy",
+              desc: "Write React, deploy live",
+            },
+          ].map(({ key, icon, label, desc }) => (
+            <button
+              key={key}
+              className="tab-btn"
+              style={tab === key ? s.tabActive : s.tab}
+              onClick={() => setTab(key)}
+            >
+              <span style={s.tabIcon}>{icon}</span>
+              <div>
+                <div style={s.tabLabel}>{label}</div>
+                <div style={s.tabDesc}>{desc}</div>
+              </div>
+              {tab === key && <div style={s.tabPill}>Selected</div>}
+            </button>
+          ))}
         </div>
 
-        {/* Tab content */}
         {tab === "github" && <GitHubDeploy navigate={navigate} />}
         {tab === "upload" && <UploadDeploy navigate={navigate} />}
-        {tab === "code" && <CodeDeploy navigate={navigate} />}
       </div>
     </div>
   );
 }
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
-
 const FONT = "'DM Sans', system-ui, sans-serif";
-
 const s = {
   page: {
     minHeight: "100vh",
@@ -754,7 +830,6 @@ const s = {
     fontFamily: FONT,
     color: "#0b0b0f",
   },
-
   topBar: {
     height: 64,
     background: "#fff",
@@ -780,9 +855,7 @@ const s = {
     cursor: "pointer",
     fontFamily: FONT,
   },
-
   wrap: { maxWidth: 1100, margin: "0 auto", padding: "36px 24px" },
-
   pageHead: { marginBottom: 24 },
   heading: {
     fontSize: 30,
@@ -791,8 +864,6 @@ const s = {
     marginBottom: 6,
   },
   sub: { fontSize: 14, color: "rgba(11,11,15,0.55)" },
-
-  // ── Tab switcher ──
   tabRow: { display: "flex", gap: 12, marginBottom: 28 },
   tab: {
     flex: 1,
@@ -806,7 +877,6 @@ const s = {
     cursor: "pointer",
     fontFamily: FONT,
     textAlign: "left",
-    transition: "border-color 0.2s, box-shadow 0.2s",
   },
   tabActive: {
     flex: 1,
@@ -841,11 +911,8 @@ const s = {
     letterSpacing: 0.5,
     flexShrink: 0,
   },
-
-  // ── Two-col layout ──
   twoCol: { display: "flex", gap: 24, alignItems: "flex-start" },
   formCol: { width: 380, flexShrink: 0 },
-
   fieldGroup: {
     background: "#fff",
     border: "1px solid rgba(0,0,0,0.08)",
@@ -898,8 +965,6 @@ const s = {
     opacity: 0.55,
     fontFamily: FONT,
   },
-
-  // ── Drop zone ──
   dropZone: {
     border: "2px dashed",
     borderRadius: 14,
@@ -926,7 +991,6 @@ const s = {
     cursor: "pointer",
     fontFamily: FONT,
   },
-
   uploadHint: {
     fontSize: 12,
     color: "rgba(11,11,15,0.55)",
@@ -942,8 +1006,6 @@ const s = {
     borderRadius: 4,
     fontSize: 11,
   },
-
-  // ── Steps / success / error ──
   stepsCard: {
     background: "#fff",
     border: "1px solid rgba(0,0,0,0.08)",
@@ -973,8 +1035,6 @@ const s = {
     color: "#dc2626",
     fontSize: 13,
   },
-
-  // ── Terminal ──
   termCol: {
     flex: 1,
     background: "#fff",
